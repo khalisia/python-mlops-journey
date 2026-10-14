@@ -1,0 +1,236 @@
+{
+  "name": "Automated Reporting Dashboard - HubSpot + GA4",
+  "nodes": [
+    {
+      "id": "schedule_trigger",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "weeks",
+              "weeksInterval": 1,
+              "triggerAtDay": [1],
+              "triggerAtHour": 8
+            }
+          ]
+        }
+      },
+      "notes": "Fires every Monday 8am. Change cadence here for testing (e.g. seconds interval) without touching anything downstream."
+    },
+    {
+      "id": "fetch_hubspot_deals",
+      "name": "Fetch HubSpot Deals",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [480, 180],
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.hubapi.com/crm/v3/objects/deals",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "limit", "value": "100" },
+            { "name": "properties", "value": "dealname,amount,dealstage,closedate" }
+          ]
+        },
+        "options": {
+          "pagination": {
+            "pagination": {
+              "paginationMode": "updateAParameterInEachRequest",
+              "parameters": {
+                "parameters": [
+                  {
+                    "type": "qs",
+                    "name": "after",
+                    "value": "={{ $response.body.paging?.next?.after }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "responseIsEmpty",
+              "limitPagesFetched": false,
+              "requestInterval": 250
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "HubSpot Private App Token"
+        }
+      },
+      "notes": "Create a private app token in HubSpot (Settings > Integrations > Private Apps) with crm.objects.deals.read scope. Store it as an n8n Header Auth credential: name 'Authorization', value 'Bearer <token>'. Pagination config walks paging.next.after until HubSpot stops returning it - this is the manual-pagination skill, don't swap in the built-in HubSpot node for this project."
+    },
+    {
+      "id": "aggregate_deals",
+      "name": "Aggregate Deals by Week",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [720, 180],
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "// Flattens paginated HubSpot pages and groups deal amount by ISO week of close date\nconst allItems = $input.all();\nconst weekly = {};\n\nfunction isoWeekKey(dateStr) {\n  const d = new Date(dateStr);\n  if (isNaN(d)) return 'unknown';\n  const target = new Date(d.valueOf());\n  const dayNr = (d.getDay() + 6) % 7;\n  target.setDate(target.getDate() - dayNr + 3);\n  const firstThursday = new Date(target.getFullYear(), 0, 4);\n  const weekNr = 1 + Math.round(((target - firstThursday) / 86400000 - 3 + ((firstThursday.getDay() + 6) % 7)) / 7);\n  return `${target.getFullYear()}-W${String(weekNr).padStart(2, '0')}`;\n}\n\nfor (const item of allItems) {\n  const results = item.json.results || [item.json];\n  for (const deal of results) {\n    const props = deal.properties || deal;\n    const week = isoWeekKey(props.closedate);\n    if (!weekly[week]) weekly[week] = { week, dealCount: 0, dealValue: 0, byStage: {} };\n    weekly[week].dealCount += 1;\n    weekly[week].dealValue += Number(props.amount) || 0;\n    const stage = props.dealstage || 'unknown';\n    weekly[week].byStage[stage] = (weekly[week].byStage[stage] || 0) + 1;\n  }\n}\n\nreturn Object.values(weekly).map(w => ({ json: w }));"
+      },
+      "notes": "Handles the fact the HTTP node returns one item per page. Groups by ISO week so it lines up with the GA4 branch."
+    },
+    {
+      "id": "fetch_ga4_sessions",
+      "name": "Fetch GA4 Sessions",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [480, 420],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://analyticsdata.googleapis.com/v1beta/properties/{{ $json.gaPropertyId || 'REPLACE_WITH_PROPERTY_ID' }}:runReport",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"dateRanges\": [{ \"startDate\": \"8daysAgo\", \"endDate\": \"yesterday\" }],\n  \"dimensions\": [{ \"name\": \"date\" }],\n  \"metrics\": [{ \"name\": \"sessions\" }]\n}"
+      },
+      "credentials": {
+        "googleApi": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Google Analytics OAuth2"
+        }
+      },
+      "notes": "Needs a Google Cloud OAuth2 client with the Google Analytics Data API enabled, and the n8n user added as a viewer on the GA4 property. Swap the property ID before running."
+    },
+    {
+      "id": "aggregate_ga4",
+      "name": "Aggregate GA4 by Week",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [720, 420],
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "// GA4 returns rows with dimensionValues (date) and metricValues (sessions)\nconst body = $input.first().json;\nconst rows = body.rows || [];\nconst weekly = {};\n\nfunction isoWeekKey(yyyymmdd) {\n  const d = new Date(`${yyyymmdd.slice(0,4)}-${yyyymmdd.slice(4,6)}-${yyyymmdd.slice(6,8)}`);\n  const target = new Date(d.valueOf());\n  const dayNr = (d.getDay() + 6) % 7;\n  target.setDate(target.getDate() - dayNr + 3);\n  const firstThursday = new Date(target.getFullYear(), 0, 4);\n  const weekNr = 1 + Math.round(((target - firstThursday) / 86400000 - 3 + ((firstThursday.getDay() + 6) % 7)) / 7);\n  return `${target.getFullYear()}-W${String(weekNr).padStart(2, '0')}`;\n}\n\nfor (const row of rows) {\n  const dateStr = row.dimensionValues[0].value;\n  const sessions = Number(row.metricValues[0].value) || 0;\n  const week = isoWeekKey(dateStr);\n  if (!weekly[week]) weekly[week] = { week, sessions: 0 };\n  weekly[week].sessions += sessions;\n}\n\nreturn Object.values(weekly).map(w => ({ json: w }));"
+      }
+    },
+    {
+      "id": "merge_by_week",
+      "name": "Merge by Week",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [960, 300],
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByFields",
+        "fieldsToMatchString": "week",
+        "options": {}
+      },
+      "notes": "Input 1 = Aggregate Deals by Week, Input 2 = Aggregate GA4 by Week. Joins on the 'week' key both branches emit."
+    },
+    {
+      "id": "format_summary",
+      "name": "Format Row and Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1180, 300],
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "const items = $input.all();\nconst rows = items.map(i => i.json);\nconst latest = rows.sort((a, b) => a.week.localeCompare(b.week)).slice(-1)[0] || {};\n\nconst sheetRows = rows.map(r => ({\n  json: {\n    week: r.week,\n    dealCount: r.dealCount ?? 0,\n    dealValue: r.dealValue ?? 0,\n    sessions: r.sessions ?? 0\n  }\n}));\n\nconst summaryText = `Weekly report for ${latest.week || 'this period'}\\n\\nDeals closed: ${latest.dealCount ?? 0}\\nDeal value: $${(latest.dealValue ?? 0).toLocaleString()}\\nWebsite sessions: ${latest.sessions ?? 0}`;\n\nreturn sheetRows.map((row, idx) => idx === 0 ? { json: { ...row.json, summaryText } } : row);"
+      },
+      "notes": "Produces one item per week for the Sheets rows, and stashes the human-readable summary on the first item for the email node to read."
+    },
+    {
+      "id": "write_sheet",
+      "name": "Write to Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [1420, 220],
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "mode": "id",
+          "value": "REPLACE_WITH_YOUR_SHEET_ID"
+        },
+        "sheetName": {
+          "mode": "name",
+          "value": "Weekly Report"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": ["week"],
+          "value": {
+            "week": "={{ $json.week }}",
+            "dealCount": "={{ $json.dealCount }}",
+            "dealValue": "={{ $json.dealValue }}",
+            "sessions": "={{ $json.sessions }}"
+          }
+        }
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Google Sheets OAuth2"
+        }
+      },
+      "notes": "appendOrUpdate matching on 'week' means reruns for the same week overwrite instead of duplicating rows - covers the 'no dupes on rerun' item in the testing checklist."
+    },
+    {
+      "id": "send_email",
+      "name": "Send Email Summary",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [1420, 380],
+      "parameters": {
+        "operation": "send",
+        "sendTo": "REPLACE_WITH_RECIPIENT_EMAIL",
+        "subject": "=Weekly automation report - {{ $json.week }}",
+        "message": "={{ $json.summaryText || 'Report generated - see attached sheet for full breakdown.' }}",
+        "options": {}
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Gmail OAuth2"
+        }
+      },
+      "notes": "Only the first item carries summaryText (see Format Row and Summary node), so this only needs to run once - add a Limit node set to 1 item before this if you see duplicate emails."
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          { "node": "Fetch HubSpot Deals", "type": "main", "index": 0 },
+          { "node": "Fetch GA4 Sessions", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Fetch HubSpot Deals": {
+      "main": [[{ "node": "Aggregate Deals by Week", "type": "main", "index": 0 }]]
+    },
+    "Aggregate Deals by Week": {
+      "main": [[{ "node": "Merge by Week", "type": "main", "index": 0 }]]
+    },
+    "Fetch GA4 Sessions": {
+      "main": [[{ "node": "Aggregate GA4 by Week", "type": "main", "index": 0 }]]
+    },
+    "Aggregate GA4 by Week": {
+      "main": [[{ "node": "Merge by Week", "type": "main", "index": 1 }]]
+    },
+    "Merge by Week": {
+      "main": [[{ "node": "Format Row and Summary", "type": "main", "index": 0 }]]
+    },
+    "Format Row and Summary": {
+      "main": [
+        [
+          { "node": "Write to Google Sheets", "type": "main", "index": 0 },
+          { "node": "Send Email Summary", "type": "main", "index": 0 }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "REPLACE_WITH_ERROR_WORKFLOW_ID"
+  }
+}
