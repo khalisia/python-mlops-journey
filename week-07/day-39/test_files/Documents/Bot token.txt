@@ -1,0 +1,15 @@
+username:@khalisia_bot
+name: khalisiabot
+token is 8161850373:AAFCstkuaHxap4pO1qGwXSZZ7BC7_2tWzKA
+curl -s "https://api.telegram.org/8161850373:AAFCstkuaHxap4pO1qGwXSZZ7BC7_2tWzKA/getUpdates" > updates.json
+
+
+
+Chat ids.
+8161850373:AAFCstkuaHxap4pO1qGwXSZZ7BC7_2tWzKA
+
+vm1: -4865160972
+vm2: -4881708725
+vm3: -4959123436
+vm4: -4982266541
+vm5: -4831648608
