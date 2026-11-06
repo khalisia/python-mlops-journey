@@ -58,6 +58,13 @@ def organize_files():
 
     print(f"\nOrganization complete. Files moved: {moved_count}")
 
+def get_category(file):
+    for folder_name, extensions in FILE_TYPES.items():
+        if file.suffix.lower() in extensions:
+            return folder_name
+
+    return None
+
 if __name__ == "__main__":
     organize_files()
 
